@@ -25,6 +25,26 @@ impl<G1, GT> DoryCommitment<G1, GT> {
     }
 }
 
+/// Compute a standardized (nu, sigma) split for a given total variable count.
+///
+/// Standardization rules:
+/// - sigma <= nu
+/// - nu + sigma = total_vars
+/// - |nu - sigma| <= 1 (as close as possible)
+///
+/// This chooses nu = ceil(total_vars/2) and sigma = floor(total_vars/2).
+/// The intent is to make the matrix as square as possible while ensuring
+/// the row dimension (2^nu) dominates and is the one covered by the
+/// reduce-and-fold rounds.
+pub fn standardize_nu_sigma(total_vars: usize) -> (usize, usize) {
+    let sigma = total_vars / 2; // floor
+    let nu = total_vars - sigma; // ceil
+    debug_assert!(nu >= sigma);
+    debug_assert_eq!(nu + sigma, total_vars);
+    debug_assert!(nu.saturating_sub(sigma) <= 1);
+    (nu, sigma)
+}
+
 /// Trait for multilinear Lagrange polynomial operations
 pub trait MultilinearLagrange<F: Field>: Polynomial<F> {
     /// Compute multilinear Lagrange basis evaluations at a point
@@ -175,42 +195,21 @@ pub(crate) fn multilinear_lagrange_basis<F: Field>(output: &mut [F], point: &[F]
 /// Given a point arranged for matrix evaluation, computes L and R such that:
 /// polynomial_evaluation(point) = L^T × M × R
 ///
-/// Splits variables between rows and columns based on sigma and nu.
+/// Standardized split: first `nu` coordinates produce the left vector L (size 2^nu),
+/// next `sigma` coordinates produce the right vector R (size 2^sigma).
 pub fn compute_left_right_vectors<F: Field>(
     point: &[F],
     nu: usize,
     sigma: usize,
 ) -> (Vec<F>, Vec<F>) {
     let mut left_vec = vec![F::zero(); 1 << nu];
-    let mut right_vec = vec![F::zero(); 1 << nu];
-    let point_dim = point.len();
-
-    match point_dim {
-        // Case 1: Constant polynomial (0 variables)
-        0 => {
-            left_vec[0] = F::one();
-            right_vec[0] = F::one();
-        }
-
-        // Case 2: All variables fit in columns (single row)
-        n if n <= sigma => {
-            multilinear_lagrange_basis(&mut right_vec[..1 << point_dim], point);
-            left_vec[0] = F::one();
-        }
-
-        // Case 3: Variables split between rows and columns (no padding)
-        n if n <= sigma * 2 => {
-            multilinear_lagrange_basis(&mut right_vec, &point[..nu]);
-            multilinear_lagrange_basis(&mut left_vec[..1 << (point_dim - nu)], &point[nu..]);
-        }
-
-        // Case 4: Too many variables - need column padding
-        _ => {
-            multilinear_lagrange_basis(&mut right_vec[..1 << sigma], &point[..sigma]);
-            multilinear_lagrange_basis(&mut left_vec, &point[sigma..]);
-        }
-    }
-
+    let mut right_vec = vec![F::zero(); 1 << sigma];
+    // Left vector from first nu coordinates
+    let left_coords = &point[..nu];
+    multilinear_lagrange_basis(&mut left_vec, left_coords);
+    // Right vector from next sigma coordinates
+    let right_coords = &point[nu..nu + sigma];
+    multilinear_lagrange_basis(&mut right_vec, right_coords);
     (left_vec, right_vec)
 }
 
@@ -235,4 +234,31 @@ fn compute_v_vec<F: Field>(coefficients: &[F], left_vec: &[F], nu: usize, sigma:
     }
 
     v_vec
+}
+
+/// Compute matrix-vector product by columns: u = M × R
+///
+/// Treats coefficients as a 2^nu × 2^sigma matrix.
+/// For each row i: u[i] = Σ_j coefficients[i][j] * right_vec[j]
+pub fn matrix_vector_product_rows<F: Field>(
+    coefficients: &[F],
+    right_vec: &[F],
+    nu: usize,
+    sigma: usize,
+) -> Vec<F> {
+    let num_cols = 1 << sigma;
+    let num_rows = 1 << nu;
+    let mut u_vec = vec![F::zero(); num_rows];
+
+    for i in 0..num_rows {
+        let mut sum = F::zero();
+        let row_start = i * num_cols;
+        let row_slice = &coefficients[row_start..row_start + num_cols];
+        for (coeff, r) in row_slice.iter().zip(right_vec.iter()) {
+            sum = sum + coeff.mul(r);
+        }
+        u_vec[i] = sum;
+    }
+
+    u_vec
 }

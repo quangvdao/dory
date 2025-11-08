@@ -32,6 +32,9 @@ pub struct DoryProverState<'a, E: PairingCurve> {
     /// Number of rounds remaining (log₂ of vector length)
     nu: usize,
 
+    /// Sigma used for padding-aware optimizations (sigma <= initial nu)
+    sigma: usize,
+
     /// Reference to prover setup
     setup: &'a ProverSetup<E>,
 }
@@ -85,6 +88,7 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
     /// - `s1`: Initial scalar vector for G1 side
     /// - `s2`: Initial scalar vector for G2 side
     /// - `setup`: Prover setup parameters
+    /// - `sigma`: Column-log dimension for padding-aware optimizations
     pub fn new(
         v1: Vec<E::G1>,
         v2: Vec<E::G2>,
@@ -92,6 +96,7 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
         s1: Vec<<E::G1 as Group>::Scalar>,
         s2: Vec<<E::G1 as Group>::Scalar>,
         setup: &'a ProverSetup<E>,
+        sigma: usize,
     ) -> Self {
         debug_assert_eq!(v1.len(), v2.len(), "v1 and v2 must have equal length");
         debug_assert_eq!(v1.len(), s1.len(), "v1 and s1 must have equal length");
@@ -113,6 +118,7 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
             s1,
             s2,
             nu,
+            sigma,
             setup,
         }
     }
@@ -157,7 +163,15 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
 
         // Compute E values for extended protocol: MSMs with scalar vectors
         // E₁β = ⟨Γ₁, s₂⟩
-        let e1_beta = M1::msm(&self.setup.g1_vec[..1 << self.nu], &self.s2[..]);
+        // Optimization for padded rounds (nu > sigma): s2 has zeros on the left half because x_t = 1.
+        // Restrict MSM to the non-zero half to save work.
+        let e1_beta = if self.nu > self.sigma {
+            let n = 1 << self.nu;
+            let n2 = n >> 1;
+            M1::msm(&self.setup.g1_vec[n2..n], &self.s2[n2..n])
+        } else {
+            M1::msm(&self.setup.g1_vec[..1 << self.nu], &self.s2[..])
+        };
 
         // E₂β = ⟨Γ₂, s₁⟩
         let e2_beta = M2::msm(&self.setup.g2_vec[..1 << self.nu], &self.s1[..]);
@@ -229,7 +243,12 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
         // E₁₊ = ⟨v₁L, s₂R⟩
         let e1_plus = M1::msm(v1_l, s2_r);
         // E₁₋ = ⟨v₁R, s₂L⟩
-        let e1_minus = M1::msm(v1_r, s2_l);
+        // Optimization for padded rounds (nu > sigma): s2L is zero vector, skip MSM.
+        let e1_minus = if self.nu > self.sigma {
+            E::G1::identity()
+        } else {
+            M1::msm(v1_r, s2_l)
+        };
         // E₂₊ = ⟨s₁L, v₂R⟩
         let e2_plus = M2::msm(v2_r, s1_l);
         // E₂₋ = ⟨s₁R, v₂L⟩
@@ -277,11 +296,18 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
         self.s1.truncate(n2);
 
         // Fold s₂: s₂ ← α⁻¹·s₂L + s₂R
-        let (s2_l, s2_r) = self.s2.split_at_mut(n2);
-        for i in 0..n2 {
-            s2_l[i] = s2_l[i] * alpha_inv + s2_r[i];
+        if self.nu > self.sigma {
+            // Optimization for padded rounds (x_t = 1): s2L = 0 ⇒ s2 ← s2R (no field ops)
+            // Move right half to the front and truncate.
+            self.s2.copy_within(n2..(n2 << 1), 0);
+            self.s2.truncate(n2);
+        } else {
+            let (s2_l, s2_r) = self.s2.split_at_mut(n2);
+            for i in 0..n2 {
+                s2_l[i] = s2_l[i] * alpha_inv + s2_r[i];
+            }
+            self.s2.truncate(n2);
         }
-        self.s2.truncate(n2);
 
         // Decrement round counter
         self.nu -= 1;

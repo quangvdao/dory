@@ -8,7 +8,7 @@
 use crate::error::DoryError;
 use crate::messages::VMVMessage;
 use crate::primitives::arithmetic::{DoryRoutines, Field, Group, PairingCurve};
-use crate::primitives::poly::MultilinearLagrange;
+use crate::primitives::poly::{matrix_vector_product_rows, MultilinearLagrange};
 use crate::primitives::transcript::Transcript;
 use crate::proof::DoryProof;
 use crate::reduce_and_fold::DoryVerifierState;
@@ -51,8 +51,8 @@ pub fn create_evaluation_proof<F, E, M1, M2, T, P>(
     polynomial: &P,
     point: &[F],
     row_commitments: Option<Vec<E::G1>>,
-    nu: usize,
-    sigma: usize,
+    _nu: usize,
+    _sigma: usize,
     setup: &ProverSetup<E>,
     transcript: &mut T,
 ) -> Result<DoryProof<E::G1, E::G2, E::GT>, DoryError>
@@ -67,17 +67,20 @@ where
     T: Transcript<Curve = E>,
     P: MultilinearLagrange<F>,
 {
-    // Validate inputs
-    let expected_len = 1 << (nu + sigma);
-    if polynomial.coefficients().len() != expected_len {
+    // Standardize (nu, sigma) to minimize special casing: nu >= sigma, |nu - sigma| <= 1
+    let total_vars = polynomial.num_vars();
+    let (nu, sigma) = crate::primitives::poly::standardize_nu_sigma(total_vars);
+
+    // Validate inputs against standardized dimensions
+    if polynomial.coefficients().len() != (1 << (nu + sigma)) {
         return Err(DoryError::InvalidSize {
-            expected: expected_len,
+            expected: 1 << (nu + sigma),
             actual: polynomial.coefficients().len(),
         });
     }
-    if point.len() != nu + sigma {
+    if point.len() != total_vars {
         return Err(DoryError::InvalidPointDimension {
-            expected: nu + sigma,
+            expected: total_vars,
             actual: point.len(),
         });
     }
@@ -90,24 +93,22 @@ where
         rc
     };
 
-    // Step 2: Split point into left and right vectors
+    // Step 2: Split point into row/col basis vectors
+    // left_vec (L) has length 2^nu from first nu coordinates; right_vec (R) has length 2^sigma from next sigma
     let (left_vec, right_vec) = polynomial.compute_evaluation_vectors(point, nu, sigma);
 
-    // Step 3: Compute v_vec (column-wise evaluations): v[j] = Σᵢ left[i] × coeffs[i][j]
-    let v_vec = polynomial.vector_matrix_product(&left_vec, nu, sigma);
+    // Step 3 (row-centric): Compute u = M × R (row-wise accumulation), length 2^nu
+    let u_vec = matrix_vector_product_rows::<F>(polynomial.coefficients(), &right_vec, nu, sigma);
 
-    // Step 4: Create VMV message (C, D2, E1)
-    // C = e(⟨row_commitments, v_vec⟩, h₂)
-    let t_vec_v = M1::msm(&row_commitments, &v_vec);
-    let c = E::pair(&t_vec_v, &setup.h2);
-
-    // D₂ = e(⟨Γ₁[nu], v_vec⟩, h₂)
-    let g1_bases_at_nu = &setup.g1_vec[..1 << nu];
-    let gamma1_v = M1::msm(g1_bases_at_nu, &v_vec);
-    let d2 = E::pair(&gamma1_v, &setup.h2);
-
-    // E₁ = ⟨row_commitments, left_vec⟩
+    // Step 4: Create VMV message (C, D2, E1) with consistent lengths 2^nu
+    // E₁ = ⟨row_commitments, L⟩
     let e1 = M1::msm(&row_commitments, &left_vec);
+    // C = e(E₁, h₂)
+    let c = E::pair(&e1, &setup.h2);
+    // D₂ = e(⟨Γ₁[nu], u⟩, h₂)
+    let g1_bases_at_nu = &setup.g1_vec[..1 << nu];
+    let gamma1_u = M1::msm(g1_bases_at_nu, &u_vec);
+    let d2 = E::pair(&gamma1_u, &setup.h2);
 
     let vmv_message = VMVMessage { c, d2, e1 };
 
@@ -116,17 +117,28 @@ where
     transcript.append_serde(b"vmv_d2", &vmv_message.d2);
     transcript.append_serde(b"vmv_e1", &vmv_message.e1);
 
-    // Step 5: Transform v_vec into G2 elements for inner product protocol
-    // v₂ = v_vec · Γ₂,fin (each scalar scales g_fin)
-    let v2 = M2::fixed_base_vector_scalar_mul(&setup.h2, &v_vec);
+    // Step 5: Transform u_vec into G2 elements for inner product protocol
+    // v₂ = u_vec · h₂ (each scalar scales h2); length 2^nu
+    let v2 = M2::fixed_base_vector_scalar_mul(&setup.h2, &u_vec);
 
     let mut prover_state = crate::reduce_and_fold::DoryProverState::new(
-        row_commitments, // v1 = T_vec_prime (row commitments)
-        v2,              // v2 = v_vec · g_fin
-        Some(v_vec.clone()), // v2_scalars available for first-round optimization
-        right_vec,       // s1 = right_vec
-        left_vec,        // s2 = left_vec
+        row_commitments,      // v1 = T_vec' (row commitments), length 2^nu
+        v2,                   // v2 = u_vec · h2, length 2^nu
+        Some(u_vec.clone()),  // v2_scalars available for first-round optimization
+        left_vec.clone(),     // s1 = basis from first nu coords (length 2^nu)
+        {
+            // s2 = basis from next sigma coords, extended with ones for the remaining (nu - sigma) dims at the end
+            let mut s2_coords = Vec::with_capacity(nu);
+            s2_coords.extend_from_slice(&point[nu..nu + sigma]);
+            while s2_coords.len() < nu {
+                s2_coords.push(F::one());
+            }
+            let mut s2_vec = vec![F::zero(); 1 << nu];
+            polynomial.lagrange_basis(&mut s2_vec, &s2_coords);
+            s2_vec
+        },
         setup,
+        sigma,
     );
 
     // Step 6: Run nu rounds of inner product protocol (reduce and fold)

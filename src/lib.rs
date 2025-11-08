@@ -58,7 +58,7 @@ pub use error::DoryError;
 pub use evaluation_proof::create_evaluation_proof;
 pub use messages::{FirstReduceMessage, ScalarProductMessage, SecondReduceMessage, VMVMessage};
 use primitives::arithmetic::{DoryRoutines, Field, Group, PairingCurve};
-pub use primitives::poly::{DoryCommitment, MultilinearLagrange, Polynomial};
+pub use primitives::poly::{standardize_nu_sigma, DoryCommitment, MultilinearLagrange, Polynomial};
 use primitives::serialization::{DoryDeserialize, DorySerialize};
 pub use proof::DoryProof;
 pub use reduce_and_fold::{DoryProverState, DoryVerifierState};
@@ -160,10 +160,10 @@ where
 ///
 /// # Parameters
 /// - `polynomial`: Polynomial implementing MultilinearLagrange trait
-/// - `point`: Evaluation point (length nu + sigma)
+/// - `point`: Evaluation point (length = num_vars)
 /// - `commitment`: Optional precomputed [`DoryCommitment`] containing both tier-1 and tier-2 commitments
-/// - `nu`: Log₂ of number of rows
-/// - `sigma`: Log₂ of number of columns
+/// - `_nu`: Ignored. Internally we standardize `nu = ceil(num_vars/2)`
+/// - `_sigma`: Ignored. Internally we standardize `sigma = floor(num_vars/2)`
 /// - `setup`: Prover setup
 /// - `transcript`: Fiat-Shamir transcript
 ///
@@ -175,8 +175,8 @@ pub fn prove<F, E, M1, M2, P, T>(
     polynomial: &P,
     point: &[F],
     commitment: Option<DoryCommitment<E::G1, E::GT>>,
-    nu: usize,
-    sigma: usize,
+    _nu: usize,
+    _sigma: usize,
     setup: &ProverSetup<E>,
     transcript: &mut T,
 ) -> Result<(E::GT, F, DoryProof<E::G1, E::G2, E::GT>), DoryError>
@@ -191,6 +191,11 @@ where
     P: MultilinearLagrange<F>,
     T: primitives::transcript::Transcript<Curve = E>,
 {
+    // Standardize (nu, sigma) to minimize special casing: nu >= sigma, |nu - sigma| <= 1
+    let total_vars = polynomial.num_vars();
+    let (nu, sigma) = standardize_nu_sigma(total_vars);
+    debug_assert_eq!(point.len(), total_vars, "Point length must equal num_vars");
+
     // 1. Commit to polynomial if not provided (get commitment and row_commitments)
     let (tier_2, row_commitments) = if let Some(comm) = commitment {
         (comm.tier_2, comm.tier_1)
@@ -222,10 +227,10 @@ where
 /// # Parameters
 /// - `commitment`: Polynomial commitment (in GT)
 /// - `evaluation`: Claimed evaluation result
-/// - `point`: Evaluation point (length nu + sigma)
+/// - `point`: Evaluation point (length = num_vars)
 /// - `proof`: Evaluation proof to verify
-/// - `nu`: Log₂ of number of rows
-/// - `sigma`: Log₂ of number of columns
+/// - `_nu`: Ignored. Internally we standardize `nu = ceil(num_vars/2)`
+/// - `_sigma`: Ignored. Internally we standardize `sigma = floor(num_vars/2)`
 /// - `setup`: Verifier setup
 /// - `transcript`: Fiat-Shamir transcript
 ///
@@ -238,8 +243,8 @@ pub fn verify<F, E, M1, M2, T>(
     evaluation: F,
     point: &[F],
     proof: &DoryProof<E::G1, E::G2, E::GT>,
-    nu: usize,
-    sigma: usize,
+    _nu: usize,
+    _sigma: usize,
     setup: VerifierSetup<E>,
     transcript: &mut T,
 ) -> Result<(), DoryError>
@@ -253,6 +258,10 @@ where
     M2: DoryRoutines<E::G2>,
     T: primitives::transcript::Transcript<Curve = E>,
 {
+    // Standardize (nu, sigma) based on the evaluation point dimension
+    let total_vars = point.len();
+    let (nu, sigma) = standardize_nu_sigma(total_vars);
+
     evaluation_proof::verify_evaluation_proof::<F, E, M1, M2, T>(
         commitment, evaluation, point, proof, nu, sigma, setup, transcript,
     )
