@@ -255,10 +255,13 @@ where
 
     // Step 4: Compute tensors (left_vec and right_vec) from evaluation point
     // The verifier uses O(nu) accumulators derived from per-dimension coordinates.
-    // Take the first `nu` coordinates for s1 (right/prover), and the last `sigma` for s2 (left/prover).
-    // For square dimensions, sigma == nu.
+    // We take the first `nu` coordinates for s1, and the last `nu` coordinates for s2.
+    // If there are fewer than `nu` remaining for s2 (when sigma < nu), pad with ones (neutral).
     let s1_coords: Vec<F> = point[..nu].to_vec();
-    let s2_coords: Vec<F> = point[nu..nu + sigma].to_vec();
+    let mut s2_coords: Vec<F> = point[nu..(nu + nu).min(point.len())].to_vec();
+    if s2_coords.len() < nu {
+        s2_coords.resize_with(nu, F::one);
+    }
 
     // Step 5: Initialize verifier state
     // d1 = commitment (T in the paper)

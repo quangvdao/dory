@@ -81,7 +81,7 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
     /// # Parameters
     /// - `v1`: Initial G1 vector
     /// - `v2`: Initial G2 vector
-    /// - `v2_scalars`: Use the scalars in the first round to avoid a multi-pairing by instead performing a (cheaper) MSM + Pairing
+    /// - `v2_scalars`: If v2 = h2 * scalars (first round), pass scalars for MSM+pair optimization
     /// - `s1`: Initial scalar vector for G1 side
     /// - `s2`: Initial scalar vector for G2 side
     /// - `setup`: Prover setup parameters
@@ -100,7 +100,7 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
             v1.len().is_power_of_two(),
             "vector length must be power of 2"
         );
-        if let Some(sc) = v2_scalars.as_ref() {
+        if let Some(ref sc) = v2_scalars {
             debug_assert_eq!(sc.len(), v2.len(), "v2_scalars must match v2 length");
         }
 
@@ -145,15 +145,12 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
         let d1_right = E::multi_pair(v1_r, g2_prime);
 
         // D₂L = ⟨Γ₁', v₂L⟩, D₂R = ⟨Γ₁', v₂R⟩
-        // In the first round, v2 = h2 * scalars, so we can compute this as the Pairing of MSM(Γ₁', scalars)
-        let (d2_left, d2_right) = if let Some(scalars) = self.v2_scalars.as_ref() {
+        // If v2 was constructed as h2 * scalars (first round), compute MSM(Γ₁', scalars) then one pairing.
+        let (d2_left, d2_right) = if let Some(ref scalars) = self.v2_scalars {
             let (s_l, s_r) = scalars.split_at(n2);
             let sum_left = M1::msm(g1_prime, s_l);
             let sum_right = M1::msm(g1_prime, s_r);
-            (
-                E::pair(&sum_left, &self.setup.h2),
-                E::pair(&sum_right, &self.setup.h2),
-            )
+            (E::pair(&sum_left, &self.setup.h2), E::pair(&sum_right, &self.setup.h2))
         } else {
             (E::multi_pair(g1_prime, v2_l), E::multi_pair(g1_prime, v2_r))
         };
@@ -200,7 +197,7 @@ impl<'a, E: PairingCurve> DoryProverState<'a, E> {
             self.v2[i] = self.v2[i] + self.setup.g2_vec[i].scale(&beta_inv);
         }
 
-        // After first combine, the `v2_scalars` optimization does not apply.
+        // After first combine, v2 is no longer fixed-base; drop scalars to avoid misuse
         self.v2_scalars = None;
     }
 
@@ -424,9 +421,8 @@ impl<E: PairingCurve> DoryVerifierState<E> {
         self.e2 = self.e2 + second_msg.e2_plus.scale(alpha);
         self.e2 = self.e2 + second_msg.e2_minus.scale(&alpha_inv);
 
-        // Update folded scalars in O(1): s1_acc *= (α·(1−y_t) + y_t), s2_acc *= (α⁻¹·(1−x_t) + x_t)
-        // Endianness note: s*_coords are stored in increasing dimension index (little-endian by dimension).
-        // Folding processes the most significant dimension first (MSB-first), so we index from the end: idx = nu - 1.
+        // Update folded scalars in O(1): s1_final *= (α·(1−y_t) + y_t), s2_final *= (α⁻¹·(1−x_t) + x_t)
+        // Determine current round index implicitly from remaining rounds (last dimension folds first).
         let idx = self.nu - 1;
         let y_t = self.s1_coords[idx];
         let x_t = self.s2_coords[idx];
@@ -460,6 +456,10 @@ impl<E: PairingCurve> DoryVerifierState<E> {
 
         let gamma_inv = (*gamma).inv().expect("gamma must be invertible");
         let d_inv = (*d).inv().expect("d must be invertible");
+
+        // Use accumulated folded scalars
+        let s1_final = self.s1_acc;
+        let s2_final = self.s2_acc;
 
         // Apply fold-scalars: update C, D₁, D₂ with gamma challenge
 
